@@ -26,9 +26,14 @@ import torch.optim as optim
 import contextlib
 
 @contextlib.contextmanager
-def _autocast(enabled: bool):
-    """AMP context manager — uses torch.amp (non-deprecated) API."""
-    with torch.amp.autocast('cuda', enabled=enabled):
+def _autocast(device_type: str, enabled: bool):
+    """AMP context manager — uses torch.amp (non-deprecated) API.
+
+    On CUDA: float16 AMP.  On XLA/CPU: disabled (XLA handles precision natively).
+    """
+    amp_device = device_type if device_type == 'cuda' else 'cpu'
+    amp_enabled = enabled and (device_type == 'cuda')
+    with torch.amp.autocast(amp_device, enabled=amp_enabled):
         yield
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
@@ -139,8 +144,9 @@ class HERMESTrainer:
             fused=True if device.type == 'cuda' else False,
         )
 
-        # Scaler for AMP
-        self.scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+        # Scaler for AMP — disabled on XLA/CPU (not supported; XLA handles precision natively)
+        _scaler_device = 'cuda' if device.type == 'cuda' else 'cpu'
+        self.scaler = torch.amp.GradScaler(_scaler_device, enabled=(device.type == 'cuda'))
 
         # EMA model (used for inference / export)
         self.ema_model = AveragedModel(
@@ -218,7 +224,7 @@ class HERMESTrainer:
             by  = by.to(self.device, non_blocking=True)
             fmt = fmt.to(self.device, non_blocking=True)
 
-            with _autocast(enabled=(self.device.type == 'cuda')):
+            with _autocast(self.device.type, enabled=(self.device.type == 'cuda')):
                 logits, h_list, aux_loss, exit_logits = self.model(
                     bx, fmt, h_list=None, targets=by, training=True
                 )
@@ -262,6 +268,15 @@ class HERMESTrainer:
                 self.ema_model.update_parameters(self.model)
                 self.global_step += 1
 
+                # XLA requires an explicit barrier to dispatch the compiled graph.
+                # No-op on CUDA/CPU.
+                if self.device.type == 'xla':
+                    try:
+                        import torch_xla.core.xla_model as xm  # noqa: PLC0415
+                        xm.mark_step()
+                    except ImportError:
+                        pass
+
                 total_bpc += bpc
                 n_updates  += 1
 
@@ -282,7 +297,7 @@ class HERMESTrainer:
             bx  = bx.to(self.device, non_blocking=True)
             by  = by.to(self.device, non_blocking=True)
             fmt = fmt.to(self.device, non_blocking=True)
-            with _autocast(enabled=(self.device.type == 'cuda')):
+            with _autocast(self.device.type, enabled=(self.device.type == 'cuda')):
                 logits, _, aux, exits = self.model(
                     bx, fmt, h_list=None, targets=None, training=False
                 )

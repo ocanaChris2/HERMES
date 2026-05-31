@@ -1,8 +1,8 @@
 # hermes_train.py
 # ─────────────────────────────────────────────────────────────────────────────
-# HERMES — Kaggle Notebook Entry Point (T4 GPU)
+# HERMES — Kaggle Notebook Entry Point
 #
-# Run this cell in a Kaggle notebook with GPU accelerator (T4):
+# Run this cell in a Kaggle notebook (GPU T4 or TPU v5e-8):
 #
 #   import subprocess, sys
 #   subprocess.check_call([sys.executable, '-m', 'pip', 'install',
@@ -11,12 +11,23 @@
 #
 # Or simply:  model = train_hermes()
 #
-# Estimated wall-clock time on T4:
-#   Phase 1 (text, 15 epochs):   ~5 h
-#   Phase 2 (binary, 25 epochs): ~8 h
-#   Export + roundtrip test:     ~5 min
-#   Total:                       ~13–14 h  (fits Kaggle 9h session if
-#                                            you reduce epochs, see CONFIG)
+# ── Accelerator selection ────────────────────────────────────────────────────
+# Set the HERMES_ACCELERATOR environment variable before importing to choose
+# which hardware backend to use.  Accepted values:
+#
+#   auto  (default) — GPU if CUDA is available, else TPU if XLA is reachable,
+#                     else CPU.
+#   gpu             — Force CUDA GPU (raises if unavailable).
+#   tpu             — Force TPU via torch_xla (raises if torch_xla missing or
+#                     no XLA device is reachable).
+#   cpu             — Force CPU (useful for quick smoke-tests).
+#
+# Example (set before launching the notebook cell):
+#   import os; os.environ['HERMES_ACCELERATOR'] = 'tpu'
+#
+# ── Estimated wall-clock times ───────────────────────────────────────────────
+# T4  GPU:      Phase 1 ~5 h, Phase 2 ~8 h,  total ~13–14 h
+# TPU v5e-8:    Phase 1 ~2 h, Phase 2 ~4 h,  total  ~6–7 h  (estimated)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os, sys, math, time, warnings, subprocess
@@ -41,22 +52,35 @@ except ImportError:
 # ── Std imports ───────────────────────────────────────────────────────────────
 import torch
 
-# Kaggle reuses the C++ PyTorch extension across kernel restarts, so the
-# operator registry already has entries from the previous run while sys.modules
-# is empty. Patch Library.define to swallow the duplicate-registration error
-# during the one-time import of torch.export.custom_ops, then restore it.
-import torch.library as _tl
+# Kaggle reuses the C++ PyTorch extension across kernel restarts: the operator
+# registry (C++ side) already has entries from the previous run while
+# sys.modules is empty, so both Library.define and Library.impl raise on
+# re-registration. Patch both to swallow those specific errors, import the
+# module that triggers them, then restore the originals.
+import torch.library as _tl, sys as _sys
 _orig_define = _tl.Library.define
+_orig_impl   = _tl.Library.impl
+_DUP_MSGS = ("Duplicate registration", "already a kernel registered from python")
 def _safe_define(self, schema, *args, **kwargs):
     try:
         return _orig_define(self, schema, *args, **kwargs)
     except RuntimeError as e:
-        if "Duplicate registration" not in str(e):
+        if not any(m in str(e) for m in _DUP_MSGS):
+            raise
+def _safe_impl(self, op_name, fn, *args, **kwargs):
+    try:
+        return _orig_impl(self, op_name, fn, *args, **kwargs)
+    except RuntimeError as e:
+        if not any(m in str(e) for m in _DUP_MSGS):
             raise
 _tl.Library.define = _safe_define
-import torch.export.custom_ops  # registers ops (or silently skips if already registered)
+_tl.Library.impl   = _safe_impl
+# Remove cached module so it re-executes under the patched methods
+_sys.modules.pop("torch.export.custom_ops", None)
+import torch.export.custom_ops
 _tl.Library.define = _orig_define
-del _tl, _orig_define, _safe_define
+_tl.Library.impl   = _orig_impl
+del _tl, _sys, _orig_define, _orig_impl, _safe_define, _safe_impl, _DUP_MSGS
 
 import torch.nn.functional as F
 import numpy as np
@@ -65,21 +89,68 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # ── Project imports ───────────────────────────────────────────────────────────
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# __file__ is undefined when run via exec() in a Jupyter cell
+try:
+    _proj_dir = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _proj_dir = os.getcwd()
+sys.path.insert(0, _proj_dir)
 
 from hermes                  import HERMES, sniff
 from training.data_pipeline  import CorpusBuilder, build_loaders
 from training.trainer        import HERMESTrainer
 from coding.coder            import compress, decompress
 from export.torchscript_export import export_hermes
+from benchmarks              import BenchmarkSuite, BenchmarkDrivenRetrainer, BenchmarkVisualizer
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # Tune these to fit your Kaggle session time budget.
 # For a 9-hour session: P1_EPOCHS=10, P2_EPOCHS=15
 # For full training:   P1_EPOCHS=15, P2_EPOCHS=25
 
-SEED          = 42
-DEVICE        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEED = 42
+
+# ── Accelerator flag ──────────────────────────────────────────────────────────
+# Override with:  os.environ['HERMES_ACCELERATOR'] = 'tpu' | 'gpu' | 'cpu'
+# or set ACCELERATOR directly here for a hard-coded default.
+ACCELERATOR = os.environ.get('HERMES_ACCELERATOR', 'auto').lower()
+
+
+def _resolve_device() -> torch.device:
+    """Return the torch.device to use, honouring HERMES_ACCELERATOR."""
+    if ACCELERATOR == 'gpu':
+        if not torch.cuda.is_available():
+            raise RuntimeError("HERMES_ACCELERATOR=gpu but no CUDA device found.")
+        return torch.device('cuda')
+
+    if ACCELERATOR == 'tpu':
+        try:
+            import torch_xla.core.xla_model as xm  # noqa: PLC0415
+            dev = xm.xla_device()
+            return dev
+        except ImportError:
+            raise RuntimeError(
+                "HERMES_ACCELERATOR=tpu but torch_xla is not installed. "
+                "On Kaggle TPU notebooks it should be pre-installed."
+            )
+        except Exception as exc:
+            raise RuntimeError(f"HERMES_ACCELERATOR=tpu: XLA device unavailable — {exc}")
+
+    if ACCELERATOR == 'cpu':
+        return torch.device('cpu')
+
+    # auto: GPU → TPU → CPU
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    try:
+        import torch_xla.core.xla_model as xm  # noqa: PLC0415
+        return xm.xla_device()
+    except Exception:
+        pass
+    return torch.device('cpu')
+
+
+DEVICE = _resolve_device()
 
 # Paths (Kaggle working directory)
 OUT_DIR       = '/kaggle/working/hermes_output'
@@ -134,21 +205,37 @@ CHUNK_SIZE    = 4096    # compression chunk size (bytes)
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def train_hermes(
-    p1_epochs: int = P1_EPOCHS,
-    p2_epochs: int = P2_EPOCHS,
-    resume:    bool = True,
+    p1_epochs:         int   = P1_EPOCHS,
+    p2_epochs:         int   = P2_EPOCHS,
+    resume:            bool  = True,
+    benchmark_loop:    bool  = True,   # run iterative benchmark+retrain after training
+    max_bench_iters:   int | None = None,  # None = unlimited (until pass/perfect/stagnation)
+    target_score:      float = 88.0,   # PERFECT_THRESHOLD by default
 ) -> HERMES:
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    print(f'Device: {DEVICE}')
-    if DEVICE.type == 'cuda':
-        print(f'GPU: {torch.cuda.get_device_name(0)} '
-              f'({torch.cuda.get_device_properties(0).total_memory // 2**20} MB)')
 
     # ── Build model ──────────────────────────────────────────────────────────
     model = HERMES(**MODEL_CFG).to(DEVICE)
-    print(f'HERMES: {model.n_params():,} parameters')
+
+    # ── Startup banner ───────────────────────────────────────────────────────
+    W = 62
+    if DEVICE.type == 'cuda':
+        _hw = (f"GPU  {torch.cuda.get_device_name(0)}"
+               f"  ({torch.cuda.get_device_properties(0).total_memory // 2**20} MB)")
+    elif str(DEVICE).startswith('xla'):
+        try:
+            import torch_xla.core.xla_model as xm  # noqa: PLC0415
+            _cores = xm.get_xla_supported_devices()
+            _hw = f"TPU v5e-8  {len(_cores)} cores  ({_cores[0]} … {_cores[-1]})"
+        except Exception:
+            _hw = f"XLA  {DEVICE}"
+    else:
+        _hw = 'CPU'
+    print('═' * W)
+    print(f'  HERMES  {model.n_params():,} params  ·  {_hw}')
+    print('═' * W)
 
     trainer = HERMESTrainer(
         model, CKPT_DIR, DEVICE,
@@ -212,6 +299,29 @@ def train_hermes(
 
     # ── Training curve ───────────────────────────────────────────────────────
     _plot_history(trainer.history, os.path.join(OUT_DIR, 'training_curve.png'))
+
+    # ── Benchmark-driven retrain loop ─────────────────────────────────────────
+    if benchmark_loop:
+        print('\n' + '═'*60)
+        print(' Benchmark + Iterative Retrain Loop')
+        print('═'*60)
+        retrainer = BenchmarkDrivenRetrainer(
+            model          = model,
+            trainer        = trainer,
+            corpus_builder = builder,
+            device         = DEVICE,
+            out_dir        = OUT_DIR,
+            chunk_size     = CHUNK_SIZE,
+            target_score   = target_score,
+        )
+        model = retrainer.run(max_iterations=max_bench_iters)
+
+        # Final combined dashboard
+        BenchmarkVisualizer().plot_training_dashboard(
+            trainer.history,
+            retrainer.history,
+            os.path.join(OUT_DIR, 'final_dashboard.png'),
+        )
 
     print(f'\nAll outputs in: {OUT_DIR}')
     return model
