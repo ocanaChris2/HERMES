@@ -287,9 +287,15 @@ def train_hermes(
     model.load_state_dict(ckpt['model'])
     model.to(DEVICE).eval()
 
-    # TorchScript export
-    export_hermes(model, MODEL_PT, DEVICE, chunk_size=CHUNK_SIZE,
-                  patch_size=MODEL_CFG['patch_size'])
+    # TorchScript export (best-effort). A scripting/tracing failure must not
+    # abort the run: hermes_ema.pt above is the canonical inference artifact,
+    # and the benchmark loop below still needs to run.
+    try:
+        export_hermes(model, MODEL_PT, DEVICE, chunk_size=CHUNK_SIZE,
+                      patch_size=MODEL_CFG['patch_size'])
+    except Exception as e:
+        print(f'  ⚠️  TorchScript export failed ({type(e).__name__}: {e})')
+        print(f'      Continuing — EMA weights are saved at {EMA_PT}')
 
     # ── Roundtrip tests ──────────────────────────────────────────────────────
     print('\n' + '═'*60)

@@ -202,7 +202,7 @@ class CorpusBuilder:
             buffers.append(_load_bytes(wiki_path, self.max_b))
             print(f'  wikitext: loaded from cache')
         else:
-            data = _stream_hf_text('wikitext', 'train', 'text', self.max_b,
+            data = _stream_hf_text('Salesforce/wikitext', 'train', 'text', self.max_b,
                                    config_name='wikitext-103-raw-v1')
             if data:
                 with open(wiki_path, 'wb') as f:
@@ -220,7 +220,7 @@ class CorpusBuilder:
             for ds_name, cfg, field in [
                 ('roneneldan/TinyStories',    None,     'text'),
                 ('HuggingFaceFW/fineweb-edu', 'sample-10BT', 'text'),
-                ('ag_news',                   None,     'text'),
+                ('fancyzhx/ag_news',          None,     'text'),
             ]:
                 data = _stream_hf_text(ds_name, 'train', field,
                                        self.max_b, config_name=cfg)
