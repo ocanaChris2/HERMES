@@ -26,15 +26,28 @@ import torch.optim as optim
 import contextlib
 
 @contextlib.contextmanager
-def _autocast(device_type: str, enabled: bool):
+def _autocast(device_type: str, enabled: bool,
+              dtype: Optional[torch.dtype] = None):
     """AMP context manager — uses torch.amp (non-deprecated) API.
 
-    On CUDA: float16 AMP.  On XLA/CPU: disabled (XLA handles precision natively).
+    On CUDA: bfloat16 where supported (no overflow, no GradScaler needed),
+    else float16.  On XLA/CPU: disabled (XLA handles precision natively).
     """
     amp_device = device_type if device_type == 'cuda' else 'cpu'
     amp_enabled = enabled and (device_type == 'cuda')
-    with torch.amp.autocast(amp_device, enabled=amp_enabled):
+    with torch.amp.autocast(amp_device, dtype=dtype, enabled=amp_enabled):
         yield
+
+
+def _select_amp_dtype(device: torch.device) -> torch.dtype:
+    """bfloat16 on hardware that supports it (Ampere/Ada/Hopper, L4, A100…),
+    otherwise float16.  bf16 has the same exponent range as float32, so the
+    forward pass cannot overflow to inf the way float16 does — this is the
+    single biggest stability win for AMP training and removes the need for a
+    GradScaler entirely.  Turing (T4) lacks bf16 → falls back to float16."""
+    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 
@@ -144,9 +157,16 @@ class HERMESTrainer:
             fused=True if device.type == 'cuda' else False,
         )
 
-        # Scaler for AMP — disabled on XLA/CPU (not supported; XLA handles precision natively)
+        # AMP dtype: bf16 where supported (no overflow), else fp16.
+        self.amp_dtype = _select_amp_dtype(device)
+
+        # GradScaler is only needed for float16 (bf16 cannot overflow to inf).
+        # Disabled on XLA/CPU (XLA handles precision natively).
         _scaler_device = 'cuda' if device.type == 'cuda' else 'cpu'
-        self.scaler = torch.amp.GradScaler(_scaler_device, enabled=(device.type == 'cuda'))
+        _use_scaler = (device.type == 'cuda' and self.amp_dtype == torch.float16)
+        self.scaler = torch.amp.GradScaler(_scaler_device, enabled=_use_scaler)
+        # Count of optimizer steps skipped because gradients were non-finite.
+        self.skipped_steps = 0
 
         # EMA model (used for inference / export)
         self.ema_model = AveragedModel(
@@ -178,6 +198,12 @@ class HERMESTrainer:
         if lr is not None:
             for g in self.optimizer.param_groups:
                 g['lr'] = lr
+                # CRITICAL: LambdaLR captures base_lr from group['initial_lr']
+                # via setdefault(), which does NOT overwrite a value left over
+                # from a previous phase's scheduler.  Without this line, Phase 2
+                # would silently train at Phase 1's base LR (e.g. 2e-4 instead of
+                # 5e-5) — the new lr above gets clobbered on the first step().
+                g['initial_lr'] = lr
 
         total_steps = n_epochs * len(trn_loader) // self.accum_steps
         self.scheduler = optim.lr_scheduler.LambdaLR(
@@ -187,8 +213,22 @@ class HERMESTrainer:
 
         start_epoch = 0
         if resume_path and os.path.exists(resume_path):
-            start_epoch = self._load(resume_path)
-            print(f'[{phase_name}] Resumed from epoch {start_epoch}')
+            # Guard: never resume from a checkpoint whose weights already
+            # diverged to NaN/Inf — that would silently restart a dead run.
+            # Inspect the saved tensors *before* clobbering in-memory weights.
+            _ck = torch.load(resume_path, map_location='cpu', weights_only=False)
+            _finite = all(
+                torch.isfinite(v).all().item()
+                for v in _ck['model'].values()
+                if torch.is_floating_point(v)
+            )
+            del _ck
+            if _finite:
+                start_epoch = self._load(resume_path)
+                print(f'[{phase_name}] Resumed from epoch {start_epoch}')
+            else:
+                print(f'[{phase_name}] ⚠️  {resume_path} has non-finite weights — '
+                      f'ignoring it and starting this phase fresh from current weights')
 
         for epoch in range(start_epoch, n_epochs):
             t0 = time.time()
@@ -224,7 +264,8 @@ class HERMESTrainer:
             by  = by.to(self.device, non_blocking=True)
             fmt = fmt.to(self.device, non_blocking=True)
 
-            with _autocast(self.device.type, enabled=(self.device.type == 'cuda')):
+            with _autocast(self.device.type, enabled=(self.device.type == 'cuda'),
+                           dtype=self.amp_dtype):
                 logits, h_list, aux_loss, exit_logits = self.model(
                     bx, fmt, h_list=None, targets=by, training=True
                 )
@@ -257,15 +298,28 @@ class HERMESTrainer:
             # Optimizer step every accum_steps micro-batches
             if (micro_step + 1) % self.accum_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.grad_clip
                 )
-                self.scaler.step(self.optimizer)
+                # Defense-in-depth: skip the update on a non-finite gradient so
+                # one bad micro-batch can never permanently poison the weights.
+                # (GradScaler already does this for fp16; this also covers the
+                # bf16 path, where the scaler is disabled.)
+                step_ok = bool(torch.isfinite(grad_norm))
+                if step_ok:
+                    self.scaler.step(self.optimizer)
+                else:
+                    self.skipped_steps += 1
+                    if self.skipped_steps <= 20 or self.skipped_steps % 50 == 0:
+                        print(f'  ⚠️  Step {self.global_step}: non-finite grad '
+                              f'(norm={grad_norm}); update skipped '
+                              f'({self.skipped_steps} total)')
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.scheduler:
                     self.scheduler.step()
-                self.ema_model.update_parameters(self.model)
+                if step_ok:
+                    self.ema_model.update_parameters(self.model)
                 self.global_step += 1
 
                 # XLA requires an explicit barrier to dispatch the compiled graph.
@@ -277,8 +331,11 @@ class HERMESTrainer:
                     except ImportError:
                         pass
 
-                total_bpc += bpc
-                n_updates  += 1
+                # Only fold finite values into the epoch average so a single
+                # skipped batch doesn't render the whole epoch's BPC as nan.
+                if math.isfinite(bpc):
+                    total_bpc += bpc
+                    n_updates  += 1
 
                 if self.global_step % 50 == 0:
                     lr_now = self.optimizer.param_groups[0]['lr']
@@ -297,7 +354,8 @@ class HERMESTrainer:
             bx  = bx.to(self.device, non_blocking=True)
             by  = by.to(self.device, non_blocking=True)
             fmt = fmt.to(self.device, non_blocking=True)
-            with _autocast(self.device.type, enabled=(self.device.type == 'cuda')):
+            with _autocast(self.device.type, enabled=(self.device.type == 'cuda'),
+                           dtype=self.amp_dtype):
                 logits, _, aux, exits = self.model(
                     bx, fmt, h_list=None, targets=None, training=False
                 )

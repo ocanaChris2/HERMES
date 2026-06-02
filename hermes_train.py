@@ -249,7 +249,18 @@ def train_hermes(
     # ── Phase 1: Text ────────────────────────────────────────────────────────
     p1_ckpt = os.path.join(CKPT_DIR, 'text_latest.pt')
     if resume and os.path.exists(p1_ckpt):
-        print('\n[Phase 1] Checkpoint found — skipping to Phase 2')
+        # Skipping Phase 1 training must still restore the Phase 1 weights into
+        # the (otherwise randomly-initialised) model + EMA — otherwise Phase 2
+        # would train from scratch on binary data.
+        print('\n[Phase 1] Checkpoint found — restoring weights, skipping to Phase 2')
+        _ck = torch.load(p1_ckpt, map_location='cpu', weights_only=False)
+        model.load_state_dict(_ck['model'])
+        try:
+            trainer.ema_model.load_state_dict(_ck['ema_model'])
+        except Exception as _e:
+            print(f'  (EMA state not restored: {_e}; EMA will re-seed from model)')
+        model.to(DEVICE)
+        del _ck
     else:
         print('\n' + '═'*60)
         print(' Phase 1 — Text corpus (wikitext + GitHub code)')
